@@ -8945,6 +8945,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paper_rollback_closes_a_first_leg_whose_quantity_rounded_up() {
+        let ledger = temp_ledger("paper-soxl-rollback").await;
+        let broker = |venue, price| {
+            Arc::new(PaperBroker::new(
+                Arc::new(FixedBook {
+                    venue,
+                    price: Arc::new(tokio::sync::Mutex::new(price)),
+                }),
+                Decimal::ZERO,
+                5,
+            ))
+        };
+        let long = broker(Venue::LighterRh, dec!(53.85));
+        let short = broker(Venue::HyperliquidXyz, dec!(53.78));
+        let executor = Executor::new(
+            Arc::clone(&ledger),
+            vec![long.clone() as Arc<dyn Broker>, short],
+        );
+
+        let mut plan = open_plan();
+        plan.symbol = Symbol::perp("SOXL", "USDT");
+        plan.long.symbol = plan.symbol.clone();
+        plan.short.symbol = plan.symbol.clone();
+        plan.short.venue = Venue::HyperliquidXyz;
+        plan.long.notional_usdt = dec!(500);
+        plan.short.notional_usdt = dec!(500);
+        plan.long.limit_price = dec!(53.92764);
+        plan.short.limit_price = dec!(53.785214);
+        let outcome = executor
+            .open(
+                &plan,
+                Strategy::Spread,
+                Decimal::ZERO,
+                "paper-soxl",
+                &PositionSetup::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.position.status, PositionStatus::Unwound);
+        assert!(long.positions().await.unwrap().is_empty());
+        let (replayed, _) = ledger.replay().await.unwrap();
+        assert_eq!(
+            replayed.orders["paper-soxl-sell-0"].status,
+            OrderStatus::Rejected
+        );
+        let exit = &replayed.orders["paper-soxl-sell-exit1"];
+        assert!(exit.order.reduce_only);
+        assert_eq!(exit.order.quantity, Some(dec!(9.28505107)));
+        assert_eq!(exit.status, OrderStatus::Filled);
+    }
+
+    #[tokio::test]
     async fn opening_prepares_both_legs_first_and_records_the_plan_against_the_fills() {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ledger = temp_ledger("open-report").await;

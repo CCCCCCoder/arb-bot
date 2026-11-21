@@ -133,7 +133,7 @@ pub struct PaperDesk {
     lock: Mutex<()>,
     last_round: RwLock<Option<RoundSummary>>,
     watch_sec: u64,
-    /// 补保证金的冷却与退避（见 [`desk::ExitRetries`]）。
+    /// 未完成退出的退避，以及补保证金的冷却（见 [`desk::ExitRetries`]）。
     retries: desk::ExitRetries,
 }
 

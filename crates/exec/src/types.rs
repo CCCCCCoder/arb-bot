@@ -378,9 +378,16 @@ pub struct LegFill {
     pub margin_usdt: Option<Decimal>,
 }
 
+pub(crate) const POSITION_QUANTITY_DP: u32 = 12;
+
 impl LegFill {
     /// 标的数量。两腿对冲的是数量，不是名义。
     pub fn quantity(&self) -> Option<Decimal> {
+        (self.average_price > Decimal::ZERO)
+            .then(|| Self::round_quantity(self.notional_usdt / self.average_price))
+    }
+
+    pub(crate) fn round_quantity(quantity: Decimal) -> Decimal {
         // 名义 ÷ 均价，舍到 12 位小数：十进制除不尽时会留一条尾巴（2026-09-30 LIT 的
         // `751.99000000000000000000000001`），对账会判成不一致、平仓单的数量也不再是步长的
         // 整数倍。真实成交数量都是步长的整数倍，12 位小数的舍入伤不到它。
@@ -389,15 +396,13 @@ impl LegFill {
         // 某次实盘 两笔成交 44 + 23，均价 2.980343283582，反推 67.000000000002，Bitget 因此
         // 15 次拒掉 reduce-only 平仓。所以再试一次 8 位小数：离它不到十亿分之一就是同一个数。
         // 真实数量最多 8 位小数；9 位以上的数（不会是交易所步长）差得出这个容差，不会被吞掉。
-        (self.average_price > Decimal::ZERO).then(|| {
-            let quantity = (self.notional_usdt / self.average_price).round_dp(12);
-            let coarse = quantity.round_dp(8);
-            if (quantity - coarse).abs() <= quantity.abs() / Decimal::from(1_000_000_000_i64) {
-                coarse.normalize()
-            } else {
-                quantity.normalize()
-            }
-        })
+        let quantity = quantity.round_dp(POSITION_QUANTITY_DP);
+        let coarse = quantity.round_dp(8);
+        if (quantity - coarse).abs() <= quantity.abs() / Decimal::from(1_000_000_000_i64) {
+            coarse.normalize()
+        } else {
+            quantity.normalize()
+        }
     }
 }
 

@@ -14,7 +14,7 @@
 //! 这个命令把整条链路跑通，但**不会碰任何真实资金**：券商是 [`arb_exec::PaperBroker`]，
 //! 它用各家的真实盘口逐档吃单算成交价与手续费。真实下单见 `arb-live`。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,13 +22,12 @@ use anyhow::{Context, Result};
 use arb_core::{Decimal, MarketSnapshot, OrderBook, Settings, Venue, logging, money::to_pct};
 use arb_exec::broker::Broker;
 use arb_exec::cli::{
-    describe, describe_rules, fetch_books, fetch_snapshots, limits_from, local_open_orders,
-    monitor_one, parse_venue, pick, print_risk, risk_of, side_label,
+    describe, describe_rules, fetch_books, limits_from, local_open_orders, parse_venue, pick,
+    print_monitor_pair, print_monitor_report, print_risk, risk_of, side_label,
 };
 use arb_exec::desk::{self, spread_edge, spread_opportunity};
 use arb_exec::{
-    Executor, Ledger, PairPosition, PositionSetup, PositionStatus, Preflight, Strategy, TaskRules,
-    plan, reconcile,
+    Executor, Ledger, PairPosition, PositionSetup, Preflight, Strategy, TaskRules, plan, reconcile,
 };
 use arb_scanner::Opportunity;
 use arb_scanner::{filter_by_base, scan};
@@ -489,47 +488,38 @@ async fn watch(
     ledger: &Arc<Ledger>,
 ) -> Result<()> {
     let interval = Duration::from_secs(cli.interval.unwrap_or(settings.scan_interval_sec).max(1));
+    let retries = desk::ExitRetries::default();
+    let ctx = desk::RoundCtx {
+        funding: &desk::PaperFunding,
+        retries: &retries,
+        exit_confirm_gap: desk::EXIT_CONFIRM_GAP,
+    };
     loop {
         let (replayed, _) = ledger.replay().await?;
-        let mut positions: Vec<PairPosition> = replayed
-            .positions
-            .values()
-            .filter(|position| position.status == PositionStatus::Open && position.is_hedged())
-            .cloned()
-            .collect();
-        positions.sort_by(|a, b| a.id.cmp(&b.id));
-
         println!(
-            "\n=== {} 监控 {} 笔双腿持仓",
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-            positions.len()
+            "\n=== {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
         );
-        if !positions.is_empty() {
-            let venues: BTreeSet<Venue> = positions
-                .iter()
-                .flat_map(|position| [position.long.as_ref(), position.short.as_ref()])
-                .flatten()
-                .map(|leg| leg.venue)
-                .collect();
-            let snapshots = fetch_snapshots(by_venue, &venues).await;
-            let flat: Vec<MarketSnapshot> = snapshots.values().cloned().collect();
-            let (executor, _) = paper_executor(
-                by_venue,
-                settings,
-                cli.depth_levels,
-                ledger,
-                &flat,
-                &positions,
-            );
-            let retries = arb_exec::desk::ExitRetries::default();
-            let ctx = arb_exec::desk::RoundCtx {
-                funding: &arb_exec::desk::PaperFunding,
-                retries: &retries,
-                exit_confirm_gap: arb_exec::desk::EXIT_CONFIRM_GAP,
-            };
-            for mut position in positions {
-                monitor_one(&executor, &mut position, &snapshots, by_venue, &ctx).await;
+        let reports = desk::paper_round_from_replay(
+            by_venue,
+            settings.fee_per_side,
+            cli.depth_levels,
+            ledger,
+            &replayed,
+            &ctx,
+        )
+        .await;
+        println!("  监控 {} 笔仓位", reports.len());
+        for report in &reports {
+            if report.retried_exit {
+                println!(
+                    "\n  [{}] {} 继续处理未完成的退出",
+                    report.position_id, report.symbol
+                );
+            } else {
+                print_monitor_pair(&replayed.positions[&report.position_id]);
             }
+            print_monitor_report(report);
         }
 
         if cli.once {

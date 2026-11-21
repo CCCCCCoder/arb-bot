@@ -24,8 +24,16 @@ pub async fn monitor_one(
     by_venue: &HashMap<Venue, Arc<dyn VenueApi>>,
     ctx: &crate::desk::RoundCtx<'_>,
 ) {
-    let (Some(long_leg), Some(short_leg)) = (position.long.clone(), position.short.clone()) else {
+    if !print_monitor_pair(position) {
         return;
+    }
+    let report = crate::desk::monitor_position(executor, position, snapshots, by_venue, ctx).await;
+    print_monitor_report(&report);
+}
+
+pub fn print_monitor_pair(position: &PairPosition) -> bool {
+    let (Some(long_leg), Some(short_leg)) = (&position.long, &position.short) else {
+        return false;
     };
     println!(
         "\n  [{}] {} 多 {} / 空 {}，杠杆 {}；规则：{}",
@@ -41,8 +49,7 @@ pub async fn monitor_one(
             )),
         describe_rules(&position.rules)
     );
-    let report = crate::desk::monitor_position(executor, position, snapshots, by_venue, ctx).await;
-    print_monitor_report(&report);
+    true
 }
 
 /// 打印一轮监控里一笔仓位的结果。评估与执行在 [`crate::desk::monitor_position`]。

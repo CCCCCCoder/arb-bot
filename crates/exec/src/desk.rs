@@ -3500,6 +3500,39 @@ impl Frozen<'_> {
     }
 }
 
+async fn retry_exit(
+    executor: &Executor,
+    mut position: PairPosition,
+    retries: &ExitRetries,
+) -> MonitorReport {
+    let mut report = MonitorReport::new(&position);
+    report.retried_exit = true;
+    let now = std::time::Instant::now();
+    if !retries.due(&position.id, now) {
+        report.skipped = Some(format!(
+            "上一次退出没成功（连续失败 {} 次），退避中，稍后再试",
+            retries.failures(&position.id)
+        ));
+        return report.finish(&position);
+    }
+    // 剩下的腿所在的场所现在下不了单（休市）：不算失败、不退避，等它开了再平。
+    if let Some(reason) = executor.exit_halted(&position).await {
+        report.skipped = Some(format!("{reason}，等能下单了再平"));
+        return report.finish(&position);
+    }
+    report.executed = true;
+    let outcome = executor.close(&mut position).await;
+    match &outcome {
+        Ok(()) => retries.succeeded(&position.id),
+        Err(_) => {
+            let failures = retries.failed(&position.id, now);
+            warn!(position = %position.id, failures, "退出重试没成功，退避后再试");
+        }
+    }
+    report.error = outcome.err().map(|error| error.to_string());
+    report.finish(&position)
+}
+
 /// 实盘一轮监控：双腿持仓按规则评估执行；没走完的退出继续重试；中断的建仓续上。
 ///
 /// `frozen`：对账不一致时**只冻结出问题的币**（见 [`Frozen`]），其余仓位照常评估规则。规则按台账评估，台账与
@@ -3538,7 +3571,6 @@ async fn round_positions(
     frozen: Frozen<'_>,
     only_opening: bool,
 ) -> Result<Vec<MonitorReport>> {
-    let retries = ctx.retries;
     let (replayed, _) = ledger.replay().await?;
     let mut positions: Vec<PairPosition> = replayed
         .exposed()
@@ -3587,14 +3619,14 @@ async fn round_positions(
             continue;
         }
         // Closing / Unwinding（上一次退出没走完）、只剩一条腿的 Open：继续退出剩下的腿。
-        let mut report = MonitorReport::new(&position);
-        report.retried_exit = true;
         if blocked
             && !matches!(
                 position.status,
                 PositionStatus::Closing | PositionStatus::Unwinding
             )
         {
+            let mut report = MonitorReport::new(&position);
+            report.retried_exit = true;
             report.skipped = Some(format!(
                 "对账不一致（{}）：这笔仓位只剩一条腿，不自动退出；请先处理对账不一致",
                 position.symbol
@@ -3602,32 +3634,7 @@ async fn round_positions(
             reports.push(report);
             continue;
         }
-        let now = std::time::Instant::now();
-        if !retries.due(&position.id, now) {
-            report.skipped = Some(format!(
-                "上一次退出没成功（连续失败 {} 次），退避中，稍后再试",
-                retries.failures(&position.id)
-            ));
-            reports.push(report.finish(&position));
-            continue;
-        }
-        // 剩下的腿所在的场所现在下不了单（休市）：不算失败、不退避，等它开了再平。
-        if let Some(reason) = executor.exit_halted(&position).await {
-            report.skipped = Some(format!("{reason}，等能下单了再平"));
-            reports.push(report.finish(&position));
-            continue;
-        }
-        report.executed = true;
-        let outcome = executor.close(&mut position).await;
-        match &outcome {
-            Ok(()) => retries.succeeded(&position.id),
-            Err(_) => {
-                let failures = retries.failed(&position.id, now);
-                warn!(position = %position.id, failures, "退出重试没成功，退避后再试");
-            }
-        }
-        report.error = outcome.err().map(|error| error.to_string());
-        reports.push(report.finish(&position));
+        reports.push(retry_exit(executor, position, ctx.retries).await);
     }
     Ok(reports)
 }
@@ -3677,7 +3684,7 @@ async fn resume_opening(
     report.finish(position)
 }
 
-/// 纸面一轮监控：只看双腿持仓（纸面没有「没走完的退出」要重试）。
+/// 纸面一轮监控：评估双腿持仓，重试已经开始的退出。
 pub async fn paper_round(
     by_venue: &HashMap<Venue, Arc<dyn VenueApi>>,
     fee_per_side: Decimal,
@@ -3686,17 +3693,32 @@ pub async fn paper_round(
     ctx: &RoundCtx<'_>,
 ) -> Result<Vec<MonitorReport>> {
     let (replayed, _) = ledger.replay().await?;
-    let mut positions: Vec<PairPosition> = replayed
-        .positions
-        .values()
-        .filter(|position| position.status == PositionStatus::Open && position.is_hedged())
-        .cloned()
+    Ok(paper_round_from_replay(by_venue, fee_per_side, depth_levels, ledger, &replayed, ctx).await)
+}
+
+/// 用调用方已重放的台账运行纸面监控。
+pub async fn paper_round_from_replay(
+    by_venue: &HashMap<Venue, Arc<dyn VenueApi>>,
+    fee_per_side: Decimal,
+    depth_levels: u32,
+    ledger: &Arc<Ledger>,
+    replayed: &Replayed,
+    ctx: &RoundCtx<'_>,
+) -> Vec<MonitorReport> {
+    let mut existing: Vec<PairPosition> = replayed.exposed().into_iter().cloned().collect();
+    existing.sort_by(|a, b| a.id.cmp(&b.id));
+    let positions: Vec<_> = existing
+        .iter()
+        .filter(|position| match position.status {
+            PositionStatus::Closing | PositionStatus::Unwinding => true,
+            PositionStatus::Open => position.is_hedged(),
+            _ => false,
+        })
         .collect();
-    positions.sort_by(|a, b| a.id.cmp(&b.id));
     if positions.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let snapshots = fetch_snapshots(by_venue, &position_venues(&positions)).await;
+    let snapshots = fetch_snapshots(by_venue, &position_venues(&existing)).await;
     let flat: Vec<MarketSnapshot> = snapshots.values().cloned().collect();
     let (executor, _) = paper_executor(
         by_venue,
@@ -3704,13 +3726,19 @@ pub async fn paper_round(
         depth_levels,
         ledger,
         &flat,
-        &positions,
+        &existing,
     );
     let mut reports = Vec::new();
-    for mut position in positions {
-        reports.push(monitor_position(&executor, &mut position, &snapshots, by_venue, ctx).await);
+    for position in positions {
+        let mut position = position.clone();
+        let report = if position.status == PositionStatus::Open {
+            monitor_position(&executor, &mut position, &snapshots, by_venue, ctx).await
+        } else {
+            retry_exit(&executor, position, ctx.retries).await
+        };
+        reports.push(report);
     }
-    Ok(reports)
+    reports
 }
 
 /// 纸面券商与执行器。费率表来自快照里的**真实**吃单费率（逐场所、逐合约）。
@@ -8134,6 +8162,82 @@ mod tests {
             assert_eq!(
                 observation.book_net_with_funding_usdt(),
                 Some(quote.net_usdt + dec!(2))
+            );
+        }
+
+        #[tokio::test]
+        async fn paper_round_retries_started_exits_from_the_ledger() {
+            let ledger = temp_ledger("started-exits").await;
+            for (id, status) in [
+                ("rollback", PositionStatus::Unwinding),
+                ("partial", PositionStatus::Closing),
+                ("opening", PositionStatus::Opening),
+            ] {
+                let mut position = position(TaskRules::default());
+                position.id = id.into();
+                position.status = status;
+                position.short = None;
+                position.long.as_mut().unwrap().notional_usdt = dec!(400);
+                position.exits = u32::from(status != PositionStatus::Opening);
+                ledger
+                    .append(&Record::Position(Box::new(position)))
+                    .await
+                    .unwrap();
+            }
+            let venue = Venue::Lighter;
+            let api = |bid| {
+                HashMap::from([(
+                    venue,
+                    Arc::new(Book {
+                        venue,
+                        bid,
+                        ask: dec!(100),
+                    }) as Arc<dyn VenueApi>,
+                )])
+            };
+            let retries = ExitRetries::default();
+            let mut ctx = RoundCtx {
+                funding: &PaperFunding,
+                retries: &retries,
+                exit_confirm_gap: std::time::Duration::ZERO,
+            };
+            let failed = paper_round(&api(Decimal::ZERO), Decimal::ZERO, 5, &ledger, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(failed.len(), 2);
+            assert!(
+                failed
+                    .iter()
+                    .all(|report| report.retried_exit && report.executed && report.error.is_some())
+            );
+            let waiting = paper_round(&api(dec!(99)), Decimal::ZERO, 5, &ledger, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(waiting.len(), 2);
+            assert!(waiting.iter().all(|report| !report.executed));
+
+            let restarted_retries = ExitRetries::default();
+            ctx.retries = &restarted_retries;
+            let recovered = paper_round(&api(dec!(99)), Decimal::ZERO, 5, &ledger, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(recovered.len(), 2);
+            assert!(recovered.iter().all(|report| {
+                report.executed && report.error.is_none() && report.status == PositionStatus::Closed
+            }));
+
+            let (replayed, _) = ledger.replay().await.unwrap();
+            for id in ["rollback", "partial"] {
+                assert!(replayed.positions[id].long.is_none());
+                assert_eq!(replayed.positions[id].exits, 3);
+                let order = &replayed.orders[&format!("{id}-sell-exit3")];
+                assert_eq!(order.order.quantity, Some(dec!(4)));
+                assert!(order.order.reduce_only);
+            }
+            assert_eq!(replayed.positions["opening"].exits, 0);
+            assert_eq!(
+                replayed.positions["opening"].status,
+                PositionStatus::Opening
             );
         }
 

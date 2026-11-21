@@ -21,7 +21,8 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::types::{
-    ClientOrderId, Fill, NewOrder, OrderAck, OrderState, OrderStatus, PairPosition, Strategy,
+    ClientOrderId, Fill, LegFill, NewOrder, OrderAck, OrderState, OrderStatus,
+    POSITION_QUANTITY_DP, PairPosition, Strategy,
 };
 
 /// 账户在某个场所的净持仓。
@@ -434,7 +435,11 @@ impl PaperBroker {
             Side::Sell => -quantity,
         };
         // 持仓归零时清掉均价，避免下次建仓沿用旧价。
-        let new_net = entry.net_quantity + signed;
+        let new_net = if order.reduce_only {
+            (entry.net_quantity + signed).round_dp(POSITION_QUANTITY_DP)
+        } else {
+            entry.net_quantity + LegFill::round_quantity(signed)
+        };
         if entry.net_quantity.is_zero()
             || entry.net_quantity.is_sign_negative() != new_net.is_sign_negative()
         {
